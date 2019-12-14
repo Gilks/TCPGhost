@@ -95,7 +95,7 @@ class TCPGhost:
 		terminate = False
 		while True:
 			try:
-				buffer = sockt.recv(64000)
+				buffer = sockt.recv(4096)
 				if len(buffer):
 					buffer_complete += buffer
 				else:
@@ -116,7 +116,7 @@ class TCPGhost:
 			pending = 0
 			try:
 				pending = sockt.pending()
-				buffer = sockt.read(64000)
+				buffer = sockt.read(4096)
 
 			except (SSL.WantReadError, ssl.SSLWantReadError):
 				if pending == 0:
@@ -181,16 +181,39 @@ class TCPGhost:
 	def send_all(self, sockt, buffer, data_from, plugin):
 		while len(buffer):
 			try:
-				self.log.info("From {0}:\n{1}\n".format(data_from, buffer.decode('ISO-8859-1')))
 				if plugin:
 					buffer = plugin(self, buffer)
-				bytes_sent = sockt.send(buffer)
+				if buffer:
+					# If the plugin returns None, it does not want us to send.
+					bytes_sent = sockt.send(buffer)
+				else:
+					break
 
 			except SSL.WantReadError:
+				# OpenSSL library. Occurs with non-blocking sockets.
+				self.log.debug('openssl raised SSLWantReadError')
+				continue
+
+			except ssl.SSLWantReadError:
+				# Python ssl library. Occurs with non-blocking sockets.
+				self.log.debug('python ssl raised SSLWantReadError')
+				continue
+
+			except ssl.SSLWantWriteError:
+				# Python ssl library. Occurs with non-blocking sockets.
+				self.log.debug('python ssl raised SSLWantWriteError')
 				continue
 
 			except SSL.WantWriteError:
+				# OpenSSL library. Occurs with non-blocking sockets.
+				self.log.debug('openssl raised SSLWantWriteError')
 				continue
+
+			if len(buffer) > 500:
+				display = buffer.decode('ISO-8859-1')[:500]
+			else:
+				display = buffer.decode('ISO-8859-1')
+			self.log.info("From {0}:\n{1}\n".format(data_from, buffer.decode('ISO-8859-1')))
 
 			if bytes_sent:
 				buffer = buffer[bytes_sent:]
@@ -424,6 +447,8 @@ if __name__ == '__main__':
 	if options.plugin:
 		try:
 			plugin = TCPGhost.load_plugin(options.plugin)
+			plugin_worker = threading.Thread(target=plugin.TCPGhostPlugin.plugin_setup,)
+			plugin_worker.start()
 		except FileNotFoundError:
 			sys.exit(os.EX_SOFTWARE)
 	else:

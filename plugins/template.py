@@ -22,6 +22,15 @@ from tcpghost import TCPGhost
 
 
 class TCPGhostPlugin(TCPGhost):
+	@staticmethod
+	def plugin_setup():
+		'''
+		This method is called once before TCPGhost() is ever instantiated. This is useful if you need to perform some
+		kind of system setup (ex. setting up a local HTTP server). Any setup done in here will be run in its own thread.
+		As TCPGhost has not been initialized at this point, you cannot access any attributes.
+		'''
+		pass
+
 	def client_socket_setup(self, sockt):
 		'''
 		This method is called once when a new client connects. You may tweak the client socket anyway you see fit as
