@@ -32,7 +32,7 @@ import plugins
 import shutil
 from importlib import util
 
-version = "0.1"
+version = "0.2"
 
 try:
 	from OpenSSL import SSL, crypto
@@ -45,12 +45,14 @@ TCPGhost is a transparent proxy with TLS support. By default, socket connections
 can be created using plugins. See the plugins folder for a template example.
 """
 
+
 class TCPGhost:
-	def __init__(self, client_socket=None, rhost=None, rport=None, cert=None, key=None, force_verification=None, plugin=None):
+	def __init__(self, client_socket=None, rhost=None, rport=None, cert=None, key=None, force_verification=None,
+				 plugin=None):
 		self.log = logging.getLogger('')
 		self.cert = cert
 		self.key = key
-		self.tls_protocol = SSL.TLSv1_2_METHOD
+		self.tls_protocol = ssl.PROTOCOL_TLSv1_2
 		self.thread = None
 		self.trusted_cert_store = None
 		self.force_verification = force_verification
@@ -58,16 +60,18 @@ class TCPGhost:
 		self.rport = rport
 		self.module = plugin
 		sockt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-		sockt.setblocking(False)
+
 		if self.module:
 			client_socket = self.module.TCPGhostPlugin.client_socket_setup(self, client_socket)
 			server_socket = self.module.TCPGhostPlugin.server_socket_setup(self, sockt)
 		else:
+			sockt.setblocking(False)
 			server_socket = sockt
-		try:
-			server_socket.connect((self.rhost, self.rport))
-		except BlockingIOError:
-			pass
+			try:
+				server_socket.connect((self.rhost, self.rport))
+			except BlockingIOError:
+				pass
+
 		self.client_socket = client_socket
 		self.server_socket = server_socket
 
@@ -95,7 +99,7 @@ class TCPGhost:
 		terminate = False
 		while True:
 			try:
-				buffer = sockt.recv(4096)
+				buffer = sockt.recv(64000)
 				if len(buffer):
 					buffer_complete += buffer
 				else:
@@ -112,19 +116,19 @@ class TCPGhost:
 	def secure_socket_read(self, sockt, label):
 		buffer_complete = b""
 		terminate = False
+
 		while True:
 			pending = 0
 			try:
+				buffer = sockt.recv(64000)
 				pending = sockt.pending()
-				buffer = sockt.read(4096)
 
 			except (SSL.WantReadError, ssl.SSLWantReadError):
 				if pending == 0:
 					break
 				continue
-
-			except Exception as e:
-				self.log.debug(e)
+			except (SSL.SysCallError, ssl.SSLSyscallError):
+				self.log.debug("SysCallError exception. Nothing left to read. Terminating..")
 				terminate = True
 				break
 
@@ -148,7 +152,7 @@ class TCPGhost:
 			buffer_server = b""
 			inputs = [self.client_socket, self.server_socket]
 
-			readable_sockets, writeable_sockets, error_sockets = select.select(inputs, [], [], 10.0)
+			readable_sockets, writeable_sockets, error_sockets = select.select(inputs, inputs, [], 10.0)
 
 			for readable_socket in readable_sockets:
 				# There's two different options for each socket. They can be encrypted or unencrypted. Each type
@@ -165,18 +169,27 @@ class TCPGhost:
 					else:
 						buffer_client, terminate = self.regular_socket_read(self.server_socket, 'server')
 
-			if self.module:
-				server_buffer_plugin = self.module.TCPGhostPlugin.server_buffer
-				client_buffer_plugin = self.module.TCPGhostPlugin.client_buffer
-			else:
-				server_buffer_plugin = None
-				client_buffer_plugin = None
+			for writeable_socket in writeable_sockets:
+				if self.module:
+					server_buffer_plugin = self.module.TCPGhostPlugin.server_buffer
+					client_buffer_plugin = self.module.TCPGhostPlugin.client_buffer
+				else:
+					server_buffer_plugin = None
+					client_buffer_plugin = None
 
-			# This buffer is on its way to the client from the server
-			self.send_all(self.client_socket, buffer_client, 'server', server_buffer_plugin)
+				if writeable_socket == self.client_socket:
+					# This buffer is on its way to the client from the server
+					buffer = buffer_client
+					tag = 'server'
+					plugin_method = server_buffer_plugin
 
-			# This buffer is on its way to the server from the client
-			self.send_all(self.server_socket, buffer_server, 'client', client_buffer_plugin)
+				else:
+					# This buffer is on its way to the server from the client
+					buffer = buffer_server
+					tag = 'client'
+					plugin_method = client_buffer_plugin
+
+				self.send_all(writeable_socket, buffer, tag, plugin_method)
 
 	def send_all(self, sockt, buffer, data_from, plugin):
 		while len(buffer):
@@ -209,10 +222,9 @@ class TCPGhost:
 				self.log.debug('openssl raised SSLWantWriteError')
 				continue
 
-			if len(buffer) > 500:
-				display = buffer.decode('ISO-8859-1')[:500]
-			else:
-				display = buffer.decode('ISO-8859-1')
+			except BlockingIOError:
+				self.log.debug('blocking IO error')
+
 			self.log.info("From {0}:\n{1}\n".format(data_from, buffer.decode('ISO-8859-1')))
 
 			if bytes_sent:
@@ -231,7 +243,8 @@ class TCPGhost:
 	def create_secure_socket(self, sockt, use_certs=False, connect=False):
 		if use_certs:
 			if not self.cert or not self.key:
-				raise FileNotFoundError("Cannot apply SSL to socket as no certificate or key was specified. Spoof one or specify a custom one.")
+				raise FileNotFoundError(
+					"Cannot apply SSL to socket as no certificate or key was specified. Spoof one or specify a custom one.")
 
 			secure_socket = ssl.wrap_socket(sockt,
 											server_side=True,
@@ -239,23 +252,18 @@ class TCPGhost:
 											keyfile=self.key,
 											ssl_version=ssl.PROTOCOL_TLSv1_2,
 											cert_reqs=ssl.CERT_NONE)
-
-			try:
-				secure_socket.do_handshake()
-			except ssl.SSLERROR as e:
-				self.log.debug("An SSL exception occured: {0}".format(e))
+			secure_socket.do_handshake()
 
 		else:
 			try:
-				ctx = SSL.Context(self.tls_protocol)
-				secure_socket = SSL.Connection(ctx, sockt)
+				ctx = ssl.SSLContext()
+				secure_socket = ctx.wrap_socket(sockt, server_hostname=self.rhost, do_handshake_on_connect=True)
 				if connect:
 					secure_socket.connect((self.rhost, self.rport))
-				sockt.setblocking(False)
+					secure_socket.do_handshake()
+					secure_socket.setblocking(False)
 
 			except ConnectionRefusedError:
-				secure_socket.close()
-				self.client_socket.close()
 				raise ConnectionRefusedError('Connection refused on target {0}:{1}'.format(self.rhost, self.rport))
 
 			except BlockingIOError:
@@ -270,8 +278,16 @@ class TCPGhost:
 			self.relay()
 
 		finally:
+			'''
+			for sockt in [self.server_socket, self.client_socket]:
+				if not type(sockt) == socket.socket:
+					try:
+						sockt = sockt.unwrap()
+					except:
+						pass
 			self.server_socket.close()
 			self.client_socket.close()
+			'''
 			self.log.info("Client disconnected. Killing: {0}".format(self.thread.name))
 
 	@staticmethod
@@ -353,7 +369,8 @@ class TCPGhost:
 		return spoofed_x509
 
 	@staticmethod
-	def generate_cert_and_key(folder_path='./ghost/certs', folder_name=None, cert_name='ghost.crt', key_name='ghost.key', x509=None, bits=4096):
+	def generate_cert_and_key(folder_path='./ghost/certs', folder_name=None, cert_name='ghost.crt',
+							  key_name='ghost.key', x509=None, bits=4096):
 		'''
 		Generate self signed certs that will be used to patch any generated payloads and verify any ghost server/client.
 		Raises exceptions if no folder_name is provided or the user specifies an invalid value for one of the
@@ -408,8 +425,10 @@ if __name__ == '__main__':
 			sys.exit(os.EX_SOFTWARE)
 
 	parser = argparse.ArgumentParser(epilog=HELP_EPILOG, formatter_class=argparse.RawTextHelpFormatter)
-	parser.add_argument('-L', dest='loglvl', action='store', choices=['INFO', 'WARNING', 'ERROR', 'CRITICAL', 'DEBUG'], default='INFO', help='set the logging level')
-	parser.add_argument("--lhost", dest="lhost", default="127.0.0.1", help="Host to bind and wait for connections, default 127.0.0.1")
+	parser.add_argument('-L', dest='loglvl', action='store', choices=['INFO', 'WARNING', 'ERROR', 'CRITICAL', 'DEBUG'],
+						default='INFO', help='set the logging level')
+	parser.add_argument("--lhost", dest="lhost", default="127.0.0.1",
+						help="Host to bind and wait for connections, default 127.0.0.1")
 	parser.add_argument("--lport", dest="lport", type=int, default=1080, help="Local port to listen on, default 1080")
 	parser.add_argument("--rhost", dest="rhost", required=True, help="Remote host (DNS or IP)")
 	parser.add_argument("--rport", dest="rport", required=True, type=int, help="Remote host port")
@@ -417,7 +436,8 @@ if __name__ == '__main__':
 	parser.add_argument("--key", dest="key", default=None, help="Key file")
 	parser.add_argument("--spoof", dest="spoof", default=None, help="URL to spoof certs from (steal and self sign)")
 	parser.add_argument("--plugin", dest="plugin", help="Name of module located in plugins folder")
-	parser.add_argument("--force_verification", dest="force_verification", action='store_true', help="Only allow connection if the target is using a cert signed by our CA")
+	parser.add_argument("--force_verification", dest="force_verification", action='store_true',
+						help="Only allow connection if the target is using a cert signed by our CA")
 
 	options = parser.parse_args()
 	logging.getLogger(logging.basicConfig(level=getattr(logging, options.loglvl), format=""))
@@ -441,7 +461,9 @@ if __name__ == '__main__':
 			is_bound = True
 		except OSError:
 			delay = 5
-			logging.error("Cannot bind to port {0} as it's currently in use. Waiting {1} seconds and trying again..".format(options.lport, delay))
+			logging.error(
+				"Cannot bind to port {0} as it's currently in use. Waiting {1} seconds and trying again..".format(
+					options.lport, delay))
 			time.sleep(delay)
 
 	if options.plugin:
@@ -477,7 +499,7 @@ if __name__ == '__main__':
 			client_socket, address = server_socket.accept()
 
 			ghost = TCPGhost(client_socket, options.rhost, options.rport, options.cert, options.key, options.force_verification, plugin)
-			worker = threading.Thread(target=ghost.relay_and_cleanup,)
+			worker = threading.Thread(target=ghost.relay_and_cleanup, )
 			threads.append(worker)
 			ghost.thread = worker
 			logging.info("Client connected. Creating: {0}".format(worker.name))
@@ -489,8 +511,4 @@ if __name__ == '__main__':
 		except FileNotFoundError as e:
 			logging.info(e)
 
-		except Exception as e:
-			logging.debug(e)
-
 	server_socket.close()
-
